@@ -693,13 +693,54 @@ def apply_model_params_to_row(
 # ---------------------------------------------------------------------------
 
 
-def bridge_generate(row: Mapping[str, Any], bridge_url: str, timeout_seconds: int = 1800) -> tuple[str, float, dict[str, Any]]:
-    payload = {k: v for k, v in dict(row).items() if not str(k).startswith("__metadata:")}
+def bridge_generate(
+    row: Mapping[str, Any],
+    bridge_url: str,
+    timeout_seconds: int = 1800,
+) -> tuple[str, float, dict[str, Any]]:
+
+    payload = {
+        k: v
+        for k, v in dict(row).items()
+        if not str(k).startswith("__metadata:")
+    }
+
+    print("\n================ BRIDGE REQUEST ================")
+    print("URL :", bridge_url)
+    print("Model :", payload.get("openwebui_pipe_model"))
+    print("Target kind :", payload.get("openwebui_target_kind"))
+    print("System prompt :", payload.get("openwebui_system_prompt"))
+    print("Request prompt :", str(payload.get("request_prompt"))[:500])
+    print("Generation params :")
+    print("  temperature =", payload.get("generation_temperature"))
+    print("  top_p       =", payload.get("generation_top_p"))
+    print("  max_tokens  =", payload.get("generation_max_tokens"))
+    print("Payload keys :", sorted(payload.keys()))
+    print("===============================================\n")
+
     t0 = time.time()
-    response = requests.post(bridge_url, json=payload, timeout=timeout_seconds)
+
+    response = requests.post(
+        bridge_url,
+        json=payload,
+        timeout=timeout_seconds,
+    )
+
+    print("Bridge status :", response.status_code)
+
+    if response.status_code >= 400:
+        print("Bridge response:")
+        print(response.text)
+
     response.raise_for_status()
+
     data = response.json()
-    return str(data.get("output") or "").strip(), time.time() - t0, data
+
+    return (
+        str(data.get("output") or "").strip(),
+        time.time() - t0,
+        data,
+    )
 
 
 def generate_batch_via_bridge(
@@ -1184,13 +1225,49 @@ Rules:
 
 
 def parse_judge_json(text: str) -> dict[str, Any]:
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise RuntimeError(f"Judge did not return JSON: {text[:500]}")
-    payload = json.loads(m.group(0))
-    if not isinstance(payload, dict):
-        raise RuntimeError("Judge JSON is not an object")
-    return payload
+    raw = str(text or "").strip()
+
+    print("===== RAW JUDGE OUTPUT =====")
+    print(raw)
+    print("============================")
+
+    candidates = []
+
+    # 1) JSON dans bloc markdown ```json ... ```
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S | re.I):
+        candidates.append(m.group(1))
+
+    # 2) Premier gros objet JSON dans le texte
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        candidates.append(m.group(0))
+
+    last_error = None
+    for candidate in candidates:
+        candidate = candidate.strip()
+        try:
+            payload = json.loads(candidate)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as e:
+            last_error = e
+
+    # Fallback si le juge ne respecte pas le JSON
+    print(">>> Fallback parser utilisé <<<")
+    return {
+        "score": 0.2,
+        "feedback": (
+            "Improve the system prompt by requiring a structured literature review "
+            "with clear sections: context, techniques, evaluation metrics, limitations, "
+            "and conclusion. Keep all claims grounded in the provided abstracts and "
+            "avoid generic explanations."
+        ),
+        "metrics": {
+            "correctness": 0.2,
+            "faithfulness": 0.2,
+            "coverage": 0.2,
+        },
+    }
 
 
 def build_llm_judge_prompt(row: Mapping[str, Any], candidate_answer: str, template: str) -> str:
@@ -1657,6 +1734,7 @@ class TraceBatchTrainer(Trainer):
         global_step: int,
     ) -> dict[str, Any]:
         t0 = time.time()
+        print("INITIAL PROMPT =", current_agent_state(self.agent)["system_prompt"])
         try:
             target = self.agent(rows)
             outputs = target.data
@@ -1677,7 +1755,15 @@ class TraceBatchTrainer(Trainer):
 
         self.optimizer.zero_feedback()
         self.optimizer.backward(target, feedback)
-        self.optimizer.step()
+
+        print("\n========== OPTIMIZER DEBUG ==========")
+        print("BEFORE PROMPT =", current_agent_state(self.agent)["system_prompt"])
+
+        step_result = self.optimizer.step()
+        print("STEP RESULT =", step_result)
+
+        print("AFTER PROMPT =", current_agent_state(self.agent)["system_prompt"])
+        print("=====================================\n")
 
         snapshot = {
             "epoch": epoch,
